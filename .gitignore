@@ -1,0 +1,24 @@
+# Dataset — not vendored. Download from AirNow, see README section 5.2
+data/*
+!data/raw/
+data/raw/*
+!data/raw/.gitkeep
+*.csv
+
+# Spark / model artifacts
+models/
+output/
+checkpoint*/
+spark-warehouse/
+metastore_db/
+derby.log
+
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# OS
+.DS_Store
