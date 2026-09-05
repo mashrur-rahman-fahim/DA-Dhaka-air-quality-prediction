@@ -1,11 +1,8 @@
-# Dataset — not vendored. Download from AirNow, see README section 5.2
-data/*
-!data/raw/
-data/raw/*
-!data/raw/.gitkeep
+# Data is downloaded by the notebook, never committed.
+data/
 *.csv
 
-# Spark / model artifacts
+# Spark and model artifacts
 models/
 output/
 checkpoint*/

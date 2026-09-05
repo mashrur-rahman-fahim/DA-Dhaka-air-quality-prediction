@@ -1,499 +1,229 @@
 # Dhaka Air-Quality Forecasting with PySpark
 
-**Short-Term PM2.5 Prediction using Big-Data Analytics (PySpark Structured Streaming + MLlib)**
+**Short-term PM2.5 prediction using big-data analytics — PySpark Structured Streaming + MLlib**
 
-> **New to this project? Read Sections 1–4. That is enough to understand what we are building and why.**
-> Sections 5–9 are the build plan. Section 10 is a glossary if any term is unfamiliar, and Section 11 answers the questions people actually ask about this design.
-
----
-
-## 1. TL;DR
-
-We are building an **early-warning system for air pollution in Dhaka**.
-
-Given the last few hours of PM2.5 readings, predict **how polluted the air will be next**. Today the response to bad air is purely reactive — people find out it is dangerous only after it already is. We want to see the spike coming *before* it arrives.
-
-The work splits into **two completely separate phases**:
-
-| Phase | Runs | Does |
-|---|---|---|
-| **Phase 1 — Trainer** | Once, offline, batch | Reads the full historical CSV, engineers features, trains a model, **saves it to disk** |
-| **Phase 2 — Predictor** | Continuously, streaming | **Loads the saved model**, receives one new hour at a time, predicts, writes the forecast out |
-
-**There is no model training in Phase 2.** This is the single most important thing to understand about the design, and Section 4 explains why.
-
-**Current status:** proposal deck complete and presented. **No code written yet.** Phase 1 has not been started.
+Predict how polluted Dhaka's air will be in the next hour, from the last few
+hours of readings. Today the response to bad air is purely reactive: people find
+out it is dangerous only once it already is. The goal is to see the spike coming
+before it arrives.
 
 ---
 
-## 1b. Quick Start — Get Running
+## Quick start
 
-**1. Get the data.** It is *not* in this repo (public government data, linked rather than vendored).
+Everything lives in **one Colab notebook**. Nothing to install, nothing to
+upload — it downloads its own data.
 
-Download from **AirNow** — US Dept. of State / EPA embassy monitoring program:
+**[Open `dhaka_pm25.ipynb` in Colab](https://colab.research.google.com/github/mashrur-rahman-fahim/DA-Dhaka-air-quality-prediction/blob/main/dhaka_pm25.ipynb)**
 
-> **https://gispub.epa.gov/airnowembassy/** → **Archive** tab → select **Dhaka** → download CSV
+Use a **CPU** runtime. Spark MLlib has no GPU support, so a GPU runtime costs
+compute units and changes nothing.
 
-Place it at:
-```
-data/raw/dhaka_air_quality_clean.csv
-```
-
-Full source details, citation, and a warning about the pre-cleaned file are in **Section 5.2**.
-
-**2. Set up Spark.** We use **Google Colab** (free, no local install):
-```python
-!pip install -q pyspark findspark
-```
-
-**3. Read before writing code.** In this order:
-- **Section 4** — the two-phase architecture. Non-negotiable; the design will not make sense without it.
-- **Section 6** — data gotchas. Every one of these silently produces a wrong model if ignored.
-- **Section 7** — Phase 1 build steps. **Start here.** Do not start Phase 2 first.
-
-**4. Confused by a term?** Section 10 is a glossary. Section 11 is an FAQ.
+New work is **appended to the bottom of that same notebook**. There is one
+notebook and one URL for the whole project, so the Spark session and every
+computed variable stay alive as the work grows.
 
 ---
 
-## 2. The Problem
+## 1. The problem
 
-Dhaka has some of the worst air quality in the world. The existing situation:
+Dhaka has some of the worst air quality in the world.
 
-- **No visibility ahead** — nobody can reliably know how bad the air will be later today or tomorrow.
+- **No visibility ahead** — nobody can reliably know how bad the air will be later today.
 - **Purely reactive** — we learn the air is dangerous only once it already is.
-- **No way to prepare** — without a forecast, nobody can plan, protect themselves, or act early.
+- **No way to prepare** — without a forecast, nobody can plan or protect themselves.
 
-**The goal:** turn a reactive problem into a proactive, predictable one.
-
-**Why it matters:**
-
-| Area | Benefit of a forecast |
+| Area | What a forecast enables |
 |---|---|
-| Health | People can wear masks, stay indoors, protect children *before* spikes hit |
-| Planning | Schools, hospitals, outdoor workers can prepare ahead |
-| Policy | Authorities get data-driven evidence for pollution-control decisions |
+| Health | Masks, staying indoors, protecting children *before* a spike |
+| Planning | Schools, hospitals and outdoor workers prepare ahead |
+| Policy | Evidence for pollution-control decisions |
 | Awareness | Makes an invisible daily danger visible |
 
----
+## 2. What we predict
 
-## 3. What We Predict
+**Primary — regression.** Next-hour PM2.5 concentration in µg/m³. Scored with
+**RMSE** (same units as the thing predicted; lower is better).
 
-Two targets, from the same pipeline.
+**Secondary — classification.** AQI category, `Good` through `Hazardous`.
+Easier for the public to read. Scored with **per-class F1 and AUC**, never plain
+accuracy — see the imbalance in Q13 below.
 
-### Primary target — Regression
-**Next-hour / next-day PM2.5 concentration**, in µg/m³.
-A continuous number. Evaluated with **RMSE** (root mean squared error — lower is better, 0 is perfect, same unit as the thing predicted).
+Every model must beat the **persistence baseline**: *"the next hour will be the
+same as this hour."* Anything that cannot beat that has learned nothing.
 
-### Secondary target — Classification
-**AQI Category** — `Good → Moderate → Unhealthy for Sensitive Groups → Unhealthy → Very Unhealthy → Hazardous`.
-A label. Easier for the public to read than a raw number. Evaluated with **AUC / per-class F1** — *not* plain accuracy, for reasons in Section 6.4.
+## 3. The data
 
-**In one line:** given the recent hours of readings, predict how polluted the air will be next.
-
----
-
-## 4. Architecture — The Two-Phase Design
-
-This is the core of the project. Read this section carefully.
-
-```
-┌─ PHASE 1 · BATCH TRAINER ────────┐     ┌─ PHASE 2 · STREAMING PREDICTOR ──┐
-│  runs occasionally (offline)     │     │  runs continuously (live)         │
-│                                  │     │                                   │
-│  historical CSV                  │     │  new hour arrives                 │
-│      ↓ clean                     │     │      ↓                            │
-│      ↓ fill hourly gaps          │     │  build lag features               │
-│      ↓ lag / rolling features    │     │      ↓                            │
-│      ↓ time-based train/test     │     │  PipelineModel.load()             │
-│      ↓ GBTRegressor.fit()        │     │      ↓                            │
-│      ↓                           │     │  .transform()  ← PREDICT ONLY     │
-│  model.save("models/pm25_v1") ───┼────▶│      ↓                            │
-└──────────────────────────────────┘     │  write forecast + alert           │
-                 ▲                       └───────────────┬───────────────────┘
-                 │                                       │
-                 └───── accumulated predictions ─────────┘
-                        + actuals → retrain → v2
-```
-
-### 4.1 Why there is no training in Phase 2
-
-**Spark MLlib has no incremental `fit()` for tree ensembles.** Calling `pipeline.fit()` on a *streaming* DataFrame throws an error — Structured Streaming supports only a subset of operations, and model training is not one of them.
-
-What **is** supported on a stream is `.transform()` — inference. So:
-
-- **Train** = batch operation on accumulated history
-- **Predict** = streaming operation on arriving data
-
-This is not a compromise or a workaround. **It is how essentially every production ML system works.** Training on a single hourly record would be statistically meaningless anyway.
-
-### 4.2 But the system still improves over time
-
-Learning happens on a **separate loop**, not inside the stream:
-
-1. The streaming job writes its inputs and predictions out to storage.
-2. Later, the batch trainer reads that accumulated history — now including hours the model has never seen — and trains **v2**.
-3. The stream picks up v2 and keeps predicting.
-
-This is called **scheduled retraining**. The streaming query still never calls `fit()`.
-
-### 4.3 Options we deliberately rejected
-
-| Option | Why not |
-|---|---|
-| `StreamingLinearRegressionWithSGD`, `StreamingKMeans` | Legacy RDD-based `pyspark.mllib` API driven by **DStreams** (deprecated), not Structured Streaming. Only linear models and k-means — **no GBT, no Random Forest**. |
-| Calling `.fit()` inside `foreachBatch` | Technically legal, but one hour = one row. Training on that is meaningless. Refitting on accumulated history is just scheduled retraining with extra steps. |
-
-### 4.4 If asked to defend the design
-
-> *"Training is a batch operation on accumulated history; inference is a streaming operation on arriving data. Separating them is deliberate — it is the standard production pattern. Retraining on a single hourly record would be statistically meaningless, and MLlib's tree ensembles have no incremental fit. The pipeline still runs end-to-end on Spark, and the model updates on a scheduled retrain loop."*
-
-That answer is stronger than claiming online training, because anyone knowledgeable already knows GBT cannot do it.
-
----
-
-## 5. The Data
-
-### 5.1 Location
-
-```
-~/Downloads/dhaka_air_quality_clean.csv     3.9 MB
-```
-
-> **TODO:** move this into the project directory (`data/raw/`) and out of `~/Downloads`.
-
-Companion proposal deck: `~/Downloads/01-Dhaka_AirQuality_Proposal_Redesigned.pptx` (12 slides)
-
-### 5.2 Where the data came from
-
-**AirNow** — the US Department of State / EPA embassy air-quality monitoring program. The CSV's column set (`NowCast Conc.`, `Raw Conc.`, `QC Name`, `AQI Category`, `Conc. Unit`, `Duration`) is that program's standard export format.
+Hourly PM2.5 from the **US Embassy monitor in Dhaka**, published through the
+AirNow programme (US Dept. of State / EPA). One station, one pollutant.
 
 | | |
 |---|---|
-| Download portal | **https://gispub.epa.gov/airnowembassy/** → *Archive* tab → select **Dhaka** → CSV |
-| Embassy page | https://bd.usembassy.gov/air-quality-data/ |
+| Range | 2016-03-01 to 2025-03-24 |
+| Rows in the files | 77,716 |
+| Usable rows | 75,374 (`qc = Valid`), of which 6 are duplicate hours |
+| Size | ~8 MB across ten yearly CSVs |
+
+**Where it comes from.** Most tutorials point at `dosairnowdata.org`. That
+domain no longer resolves. The live source, which the EPA's own embassy map
+reads from, is public and needs no API key:
+
+```
+https://s3-us-west-1.amazonaws.com/files.airnowtech.org/airnow/EmbassyHistorical/Dhaka/<YEAR>/Dhaka_PM2.5_<YEAR>_YTD.csv
+```
+
+The notebook downloads these itself. Nothing is committed to the repo.
 
 **Citation for the report:**
 
 ```
 U.S. Department of State and U.S. Environmental Protection Agency,
 "AirNow Department of State — Dhaka, Bangladesh (PM2.5)."
-Available: https://gispub.epa.gov/airnowembassy/
-Data range used: 2016-03-01 to 2020-09-05 (36,561 hourly records).
+https://gispub.epa.gov/airnowembassy/
+Data range used: 2016-03-01 to 2025-03-24 (75,374 valid hourly records).
 ```
 
-> ⚠️ **The file on disk is not the raw download.** The `_clean` suffix means it was post-processed by someone on the team — confirmed by profiling (`QC Name` is 100% `Valid`, so non-valid rows were already stripped). A fresh download from AirNow will contain **more rows** and **non-`Valid` QC entries you must filter yourself**.
->
-> **TODO:** track down the original raw file and the cleaning script from whoever downloaded it. For a publication the cleaning step must be reproducible.
+### Columns
 
-### 5.3 Source and shape
-
-| Property | Value |
-|---|---|
-| Source | **U.S. Embassy Dhaka monitor (AirNow)**, pre-cleaned |
-| Rows | **36,561** hourly records |
-| Range | **2016-03-01 03:00** → **2020-09-05 00:00** |
-| Site | `Dhaka` — single station |
-| Parameter | `PM2.5 - Principal` — single pollutant |
-
-Rows per year: 2016 → 7,321 · 2017 → 8,476 · 2018 → 6,477 · 2019 → 8,597 · 2020 → 5,690
-
-### 5.4 Schema
-
-| Column | Type | What it is | How it is used |
-|---|---|---|---|
-| *(unnamed first column)* | int | Pandas index artifact | **Drop it** |
-| `Site` | string | Station location | Constant (`Dhaka`) — drop, but keep in mind for scaling to more stations |
-| `Parameter` | string | Pollutant name | Constant (`PM2.5 - Principal`) — drop |
-| `Year`, `Month`, `Day`, `Hour` | int | Split time components | `Hour` and `Month` become features (daily peaks, winter seasonality) |
-| `NowCast Conc.` | double | AirNow's smoothed concentration | Optional feature — **see leakage warning in 6.5** |
-| `AQI` | int | Standard 0–500 index | Alternative target, or a feature |
-| `AQI Category` | string | `Good` … `Hazardous` | **The classification target** |
-| `Raw Conc.` | double | Measured PM2.5 in µg/m³ | **The regression target** — the value we predict |
-| `Conc. Unit` | string | Always `UG/M3` | Drop |
-| `Duration` | string | Always `1 Hr` | Drop |
-| `QC Name` | string | Quality flag | **All 36,561 rows are `Valid`** — filtering on this is a no-op |
-| `Date` | string | `YYYY-MM-DD HH:MM:SS` | **Parse to timestamp** — orders the series, drives all lag features |
-
-### 5.5 Value distribution
-
-`Raw Conc.` — min **−4.0**, max **985.0**, mean **82.5** µg/m³
-
-`AQI Category` counts:
-
-| Category | Count | Share |
+| Column | What it is | Verdict |
 |---|---|---|
-| Unhealthy | 12,367 | 33.8% |
-| Moderate | 9,899 | 27.1% |
-| Unhealthy for Sensitive Groups | 7,279 | 19.9% |
-| Very Unhealthy | 4,690 | 12.8% |
-| Hazardous | 1,309 | 3.6% |
-| **Good** | **1,017** | **2.8%** |
+| `site`, `parameter`, `unit`, `duration` | Station, pollutant, µg/m³, 1 Hr | Constant. Drop. |
+| `date_text` | `2016-01-01 01:00 AM`, 12-hour format | Superseded by a real timestamp |
+| `year`, `month`, `day`, `hour` | Split time components | Timestamp is built from these |
+| `nowcast` | AirNow's smoothed concentration | **Leaks — see Q12** |
+| `aqi` | Standard 0–500 index | **Leaks — see Q12** |
+| `aqi_category` | `Good` … `Hazardous` | Classification target; **leaks as an input** |
+| `pm25` (`Raw Conc.`) | Measured PM2.5 | **The regression target** |
+| `qc` | Quality flag | Filter on it. Not a no-op. |
 
----
+## 4. What the exploration found
 
-## 6. Data Gotchas — Read Before Writing Any Code
+Produced by Q1–Q15 in the notebook. Every number is from the real file.
 
-These were found by profiling the actual file. Each one will silently produce a wrong model if ignored.
+| # | Question | Finding |
+|---|---|---|
+| Q1 | Useful columns? | Four never vary. Dead weight. |
+| Q2 | Quality flag? | 2,342 of 77,716 rows are not `Valid` and hold `-999`. |
+| — | Duplicate hours? | **6 hours appear twice**, from the seams between yearly files. |
+| — | Impossible values? | **24 readings are negative**, as low as −4.0 µg/m³. |
+| Q4 | Missing hours? | 5.1% missing across **517 gaps**. 419 are a single hour; the worst is **1,822 hours (76 days)**. |
+| Q5 | Distribution? | Median 65, mean 93, max 985. Skew **+1.86** raw, **−0.25** under `log(1+x)`. |
+| Q6 | Season? | January averages **200**, July **31** — a **6.4× swing**. Strongest pattern in the data. |
+| Q7 | Time of day? | Peaks near midnight (112), dips mid-afternoon (63). |
+| Q8 | Day of week? | Spans under 7 µg/m³. Effectively no signal. |
+| Q9 | Yearly trend? | Drifts upward, but the final year is partial and dry-season only. |
+| Q10 | Volatility? | Hour-to-hour SD **33.2**. 7.1% of hours move more than 50. |
+| Q11 | Memory? | Correlation **0.92** at 1h, **0.55** at 12h, back up to **0.72** at 24h. |
+| Q12 | `nowcast` / `aqi`? | Correlate **0.97** / **0.94** with the same-hour target. |
+| Q13 | Health? | Only **2%** of hours are `Good`. A third are `Unhealthy` or worse. |
 
-### 6.1 ~7.6% of hours are missing — and one gap is 76 days
+### Three findings that constrain every later decision
 
-| Metric | Value |
-|---|---|
-| Expected hourly slots in range | 39,574 |
-| Actual rows | 36,561 |
-| **Missing hours** | **3,013 (7.6%)** |
-| Number of separate gaps | **227** |
-| Gaps of 2–3 hours | 165 (mostly harmless) |
-| Gaps longer than 24 hours | **13** |
-| **Largest single gap** | **1,824 hours ≈ 76 days** |
+**Q12 — `nowcast`, `aqi` and `aqi_category` contain the answer.** `nowcast` is a
+weighted average of roughly the last twelve hours *including the current one*,
+and `aqi` is computed from it — the EPA breakpoint formula reproduces 89.6% of
+published AQI values from `nowcast`. The visible consequence is that
+`aqi_category` bands overlap heavily in raw PM2.5: `Good` spans 0–19,
+`Unhealthy` spans 13–272. Use any of the three for the current hour and the
+model scores beautifully in testing and fails completely in reality.
 
-**Why this breaks things.** `F.lag("Raw Conc.", 1).over(Window.orderBy("Date"))` counts **rows, not hours**. Across a gap it will happily hand you a reading from 76 days ago while labelling it `lag_1`. The model then learns from garbage.
+Also: **94 rows are flagged `Valid` yet still hold `-999`** in `nowcast`. A
+quality flag is not a guarantee.
 
-**Fix — one of:**
-- Reindex onto a **complete hourly spine** (generate every hour in the range, left-join the data, leaving explicit nulls), then lag over that; or
-- Use a **time-range window** (`rangeBetween` on a timestamp cast to seconds) instead of `rowsBetween`.
+**Q4 — `lag()` counts rows, not hours.** With 5.1% of hours missing, "one row
+back" and "one hour back" are different things. Lagging raw rows would hand the
+model a reading from 76 days earlier while labelling it `lag_1`.
 
-Then drop rows whose lag features fall inside a gap.
+**Q11 — 24 hours ago beats 12 hours ago.** The correlation curve falls and then
+*rises again* at 24h. The daily cycle is real, and this is the evidence for
+which lags are worth building.
 
-### 6.2 13 rows have negative PM2.5
+## 5. Open decisions
 
-`Raw Conc.` goes as low as **−4.0**. A negative particulate concentration is physically impossible — this is sensor noise near zero.
+The exploration deliberately settles nothing. These are the calls to make:
 
-**Fix:** clip to 0, or drop those 13 rows. Either is defensible; document which you chose.
+1. **Constant columns** — Q1 settles it: drop.
+2. **`-999` rows** — Q2 settles it: drop. This leaves holes in time, which feeds into 3.
+2b. **Duplicate hours and negative readings** — the 6 duplicates must go before anything is sorted by time. The 24 negatives can be nudged to 0 or dropped; nudging keeps the hour in the series, dropping punches another hole in it.
+3. **Missing hours** — build a complete hourly timeline, or fill small gaps and cut around large ones. The 76-day gap needs handling either way.
+4. **`nowcast` / `aqi`** — drop entirely, or keep only their *past* values. Their high correlation makes lagged versions potentially useful.
+5. **Which lags** — 1, 2, 3 and 24 are supported by Q11. Whether 168 (one week) earns its place is open; it costs rows.
+6. **Calendar inputs** — Q6 favours month, Q7 favours hour, Q8 argues against day of week.
+7. **Transform the target?** — Q5 says `log(1+x)` is far more symmetric. Test both.
+8. **Train/test cut-off** — must be by time, never `randomSplit`. Q3 and Q9 warn that the final partial year is dry-season only, so testing on it alone is seasonally biased.
+9. **Which model** — gradient-boosted trees handle skew and interactions without scaling and report feature importance. A linear model makes a good sanity check.
+10. **PCA?** — probably not. After dropping constant and leaky columns there are about three real inputs. Trees are untroubled by correlated features, and PCA would destroy the *"the reading 24 hours ago mattered most"* result. Revisit only if weather data or more stations are added.
 
-### 6.3 `QC Name` filtering is unnecessary
+## 6. Architecture
 
-All 36,561 rows are already `Valid`. The file is pre-cleaned. Filtering on it does nothing — do not waste a stage on it, and do not claim it as a cleaning step in the report.
+Two phases, deliberately separate.
 
-### 6.4 The classification target is badly imbalanced
-
-`Good` is **2.8%** of rows; `Unhealthy` is **33.8%**. A model that *never once* predicts `Good` still scores well on plain accuracy.
-
-**Fix:** report **AUC and per-class precision/recall/F1**, never bare accuracy. Consider class weights.
-
-### 6.5 Do not leak the answer into the features
-
-Two specific traps:
-
-- **`NowCast Conc.`** is a smoothed function of recent readings *including the current hour*. If you predict `Raw Conc.` at time *t* using `NowCast` at time *t*, you are feeding the model the answer. Use only **lagged** NowCast, or drop it.
-- **Rolling windows must end at `-1`, not `0`.** `rowsBetween(-3, -1)` looks at the previous three hours. `rowsBetween(-2, 0)` includes the current hour — which holds the value you are trying to predict.
-
-### 6.6 Never split this data randomly
-
-`randomSplit([0.8, 0.2])` shuffles rows, which lets the model train on the future and test on the past. For time series that inflates every metric and means nothing.
-
-**Split by time.** For example: train on 2016-03 → 2019-12, test on 2020. State the cut-off explicitly in the report.
-
----
-
-## 7. Phase 1 — Batch Trainer (build this first)
-
-**Do not start Phase 2 until Phase 1 produces an honest RMSE.** Streaming is the delivery mechanism, not the model. Debugging both at once means you will not know whether a bad number is a broken model or a broken stream. Phase 1 also produces the saved artifact that Phase 2 requires in order to exist at all.
-
-### Steps
-
-1. **Load** the CSV with an **explicit schema** (do not rely on inference — Phase 2 will require an explicit schema anyway, so write it once and reuse it).
-2. **Clean** — drop the unnamed index / `Site` / `Parameter` / `Conc. Unit` / `Duration` / `QC Name`; parse `Date` to timestamp; handle the 13 negative values.
-3. **Gap-fill** — build the complete hourly spine (Section 6.1).
-4. **Feature-engineer** — `lag_1`, `lag_2`, `lag_3`, `lag_24` (same hour yesterday), `rolling_avg_3`, `rolling_avg_24`, plus `Hour` and `Month` for daily and seasonal cycles. Then `.na.drop()`.
-5. **Split by time** (Section 6.6).
-6. **Assemble + train** — `VectorAssembler` → `GBTRegressor` inside a `Pipeline`.
-7. **Evaluate** — `RegressionEvaluator` with `rmse` on the held-out *later* period. Compare against a **persistence baseline** ("tomorrow = today"); if the model cannot beat that, it has learned nothing.
-8. **Save** — `pipeline_model.write().overwrite().save("models/pm25_v1")`.
-
-### Sketch
-
-```python
-from pyspark.sql import SparkSession, functions as F
-from pyspark.sql.window import Window
-from pyspark.ml import Pipeline
-from pyspark.ml.feature import VectorAssembler
-from pyspark.ml.regression import GBTRegressor
-from pyspark.ml.evaluation import RegressionEvaluator
-
-# 4. features  (window must be gap-safe — see 6.1)
-w = Window.orderBy("ts")
-df = (df
-      .withColumn("lag_1",  F.lag("pm25", 1).over(w))
-      .withColumn("lag_2",  F.lag("pm25", 2).over(w))
-      .withColumn("lag_24", F.lag("pm25", 24).over(w))
-      .withColumn("roll_3", F.avg("pm25").over(w.rowsBetween(-3, -1)))
-      .na.drop())
-
-# 5. TIME split — never randomSplit
-train = df.filter(F.col("ts") <  "2020-01-01")
-test  = df.filter(F.col("ts") >= "2020-01-01")
-
-# 6. train
-assembler = VectorAssembler(
-    inputCols=["lag_1", "lag_2", "lag_24", "roll_3", "Hour", "Month"],
-    outputCol="features")
-gbt = GBTRegressor(featuresCol="features", labelCol="pm25", maxIter=50, seed=42)
-model = Pipeline(stages=[assembler, gbt]).fit(train)
-
-# 7. evaluate on the LATER period
-rmse = RegressionEvaluator(labelCol="pm25", metricName="rmse").evaluate(
-        model.transform(test))
-print("RMSE:", rmse)
-
-# 8. save
-model.write().overwrite().save("models/pm25_v1")
+```
+┌─ TRAINER (batch, offline) ───────┐     ┌─ PREDICTOR (streaming, live) ────┐
+│  historical CSV                  │     │  new hour arrives                 │
+│      ↓ clean                     │     │      ↓ build lag features         │
+│      ↓ fill hourly gaps          │     │      ↓ PipelineModel.load()       │
+│      ↓ lag / rolling features    │     │      ↓ .transform()  PREDICT ONLY │
+│      ↓ time-based train/test     │     │      ↓                            │
+│      ↓ GBTRegressor.fit()        │     │  write forecast + alert           │
+│  model.save(...) ────────────────┼────▶│                                   │
+└──────────────────────────────────┘     └───────────────┬───────────────────┘
+                 ▲                                       │
+                 └───── accumulated predictions ─────────┘
+                        + actuals → retrain → v2
 ```
 
----
+**There is no training in the streaming phase.** This is the single most
+important thing about the design.
 
-## 8. Phase 2 — Streaming Predictor
+Calling `pipeline.fit()` on a *streaming* DataFrame throws — Structured
+Streaming supports only a subset of operations, and training is not one of them.
+`.transform()` (inference) *is* supported. So training is a batch operation on
+accumulated history, and prediction is a streaming operation on arriving data.
 
-### 8.0 Which streaming API — read this before Googling anything
+This is not a workaround. It is how essentially every production ML system
+works, and training on a single hourly record would be statistically meaningless
+anyway. MLlib's tree ensembles have no incremental `fit` in any Spark API.
 
-Spark has **two** streaming APIs. Only one is alive.
+The system still improves, on a **separate loop**: the streaming job writes its
+predictions out, the batch trainer later reads that accumulated history and
+produces `v2`, and the stream picks `v2` up mid-flight via a version marker.
 
-| API | Entry point | Status | Use it? |
-|---|---|---|---|
-| **Structured Streaming** | `spark.readStream` / `spark.writeStream` — built on DataFrames | Current | ✅ **This one** |
-| **Spark Streaming (DStreams)** | `pyspark.streaming.StreamingContext` | **Deprecated** since Spark 3.4 | ❌ Never |
+### Rejected alternatives
 
-⚠️ **Searching *"PySpark streaming tutorial"* returns mostly DStream tutorials.** They are the old RDD-based API. They will not integrate with MLlib pipelines, and they are the same dead branch as `StreamingLinearRegressionWithSGD` (Section 4.3). **If a code sample uses `StreamingContext`, close the tab.**
-
-**Phase split, to be unambiguous:**
-
-- **Phase 1 is batch only** — plain `spark.read.csv`, no streaming anywhere in it.
-- **Phase 2 is Structured Streaming** — `readStream` → `foreachBatch` → load model → `transform` → write.
-
-Both are PySpark. Only Phase 2 streams.
-
-### 8.1 The constraint that shapes everything
-
-**`F.lag().over(Window.orderBy(...))` does not work on a streaming DataFrame.** Non-time-based window functions are unsupported in Structured Streaming — and lags are our entire feature set.
-
-Three ways out, cheapest first:
-
-1. **`foreachBatch`** — each micro-batch arrives as an ordinary *batch* DataFrame, so `Window` + `lag` work normally inside it. **This is the right answer for this project.**
-2. **Time-window aggregations** — `groupBy(window(col("ts"), "3 hours", "1 hour"))` *is* supported natively. Good for rolling averages, useless for an exact `lag_1`.
-3. **`applyInPandasWithState`** (Spark 3.4+) — real per-key state. Correct, but heavy for this scope.
-
-### 8.2 The follow-on problem
-
-With `foreachBatch`, `lag_1` for the newest hour needs the *previous* hour — which arrived in a *previous* batch. Solve it by keeping a small rolling **"recent readings" table** (parquet, last ~48 rows) that each batch appends to and reads back before building features.
-
-### 8.3 Sketch
-
-```python
-from pyspark.ml import PipelineModel
-
-_model, _model_version = None, None
-
-def process_batch(batch_df, batch_id):
-    global _model, _model_version
-    latest = read_version_marker()                 # tiny text/json file
-    if latest != _model_version:                   # hot-swap, no restart
-        _model = PipelineModel.load(f"models/pm25_{latest}")
-        _model_version = latest
-
-    append_to_recent(batch_df)                     # rolling history table
-    feats = build_lag_features(read_recent())      # Window/lag OK here — batch DF
-    preds = _model.transform(feats)
-    preds.write.mode("append").parquet("output/predictions")
-
-(spark.readStream
-      .schema(SCHEMA)                              # REQUIRED — see 8.4
-      .option("maxFilesPerTrigger", 1)             # replays hour by hour
-      .csv("data/stream_in/")
-      .writeStream
-      .foreachBatch(process_batch)
-      .start())
-```
-
-The version-marker check gives a nice demo property: retrain in another notebook, save `v2`, and the running stream swaps to it **mid-flight**. Do not reload every batch — that is a full model deserialise per hour for nothing.
-
-### 8.4 Two things that trip everyone on first run
-
-- **`readStream` cannot infer schema.** You must pass one explicitly. Batch can infer; streaming cannot. (This is why Phase 1 step 1 says write the schema once.)
-- **`maxFilesPerTrigger=1`** is what makes the demo *look* like live hourly arrival. Without it Spark consumes every file at once.
-
----
-
-## 9. Tech Stack & Environment
-
-| Component | Choice |
+| Option | Why not |
 |---|---|
-| Platform | **Google Colab** (free, no local setup) |
-| Engine | **PySpark** |
-| Streaming | **Spark Structured Streaming** |
-| ML | **Spark MLlib** |
-| Models | `GBTRegressor` (regression) · classifier TBD for AQI Category |
+| `StreamingLinearRegressionWithSGD`, `StreamingKMeans` | Legacy RDD API driven by **DStreams**, deprecated since Spark 3.4. Linear models and k-means only — no GBT, no Random Forest. |
+| `.fit()` inside `foreachBatch` | Legal, but one hour is one row. Refitting on accumulated history is just scheduled retraining with extra steps. |
 
-**Scalability claim:** the same pipeline extends from one station to all of Bangladesh. The `Site` column already exists for exactly that — partition by it and the design carries over unchanged.
+### Two things that trip everyone
 
----
+- **`readStream` cannot infer a schema.** Batch can; streaming cannot. This is why the notebook writes the schema out by hand in Step 7.
+- **`F.lag().over(Window.orderBy(...))` does not work on a streaming DataFrame.** Non-time-based window functions are unsupported, and lags are the entire feature set. The way out is `foreachBatch`, where each micro-batch arrives as an ordinary batch DataFrame and `Window` works normally.
 
-## 10. Glossary
+## 7. Conventions
+
+- **One notebook.** Work is appended to `dhaka_pm25.ipynb`, never split into new files.
+- **Seed everything.** A single `SEED` is fixed in Step 3 and passed to every sample, split and estimator, so a metric that moves between runs moves because something changed — not because the dice landed differently.
+- **Never `randomSplit` on this data.** Shuffling lets the model train on the future and be tested on the past.
+- **Rolling windows end at `-1`, never `0`.** `rowsBetween(-3, -1)` is the three hours before now; `rowsBetween(-2, 0)` includes the value being predicted.
+
+## 8. Glossary
 
 | Term | Meaning |
 |---|---|
-| **PM2.5** | Fine particulate matter under 2.5 µm. The pollutant we forecast. Measured in µg/m³. |
-| **AQI** | Air Quality Index, 0–500. A standardised human-readable scale derived from PM2.5. |
-| **Transformer** | A Spark ML stage that needs to learn nothing — call `.transform()` directly. e.g. `VectorAssembler`. |
-| **Estimator** | A Spark ML stage that must study the data first — call `.fit()`, which returns a Model (which is a Transformer). e.g. `GBTRegressor`. |
-| **Pipeline** | An ordered list of stages. `Pipeline.fit()` returns a `PipelineModel`. **Save the PipelineModel, load with `PipelineModel.load`.** |
-| **features / label** | Every Spark ML model eats exactly two columns: `features` (one vector) and `label` (one number). Everything before the model exists to build those two. |
-| **Lag feature** | A past value used as an input, e.g. `lag_1` = the reading one hour ago. |
-| **Data leakage** | Accidentally letting the answer into the inputs. Produces models that score beautifully and fail completely in reality. |
-| **RMSE** | Root Mean Squared Error. "On average, how far off were we?" Same units as the target. Lower is better. |
-| **AUC** | Area Under ROC Curve. Classification quality. 1.0 perfect, 0.5 coin-flip. Higher is better. |
-| **`foreachBatch`** | Structured Streaming escape hatch — hands you each micro-batch as a normal batch DataFrame, where all batch operations work. |
+| **PM2.5** | Fine particulate matter under 2.5 µm, in µg/m³. What we forecast. |
+| **AQI** | Air Quality Index, 0–500. A human-readable scale derived from PM2.5. |
+| **NowCast** | AirNow's smoothed concentration, weighted over ~12 recent hours. |
+| **Lag feature** | A past value used as an input. `lag_1` is the reading one hour ago. |
+| **Data leakage** | Letting the answer into the inputs. Produces models that score well and fail in reality. |
+| **RMSE** | Root mean squared error. Same units as the target. Lower is better. |
 | **Persistence baseline** | The trivial forecast "next value = current value". Any real model must beat it. |
+| **Estimator / Transformer** | An estimator must study the data first (`.fit()`); a transformer does not (`.transform()`). |
+| **Pipeline** | An ordered list of stages. `Pipeline.fit()` returns a `PipelineModel` — save that, not the bare model. |
+| **`foreachBatch`** | Structured Streaming escape hatch: hands you each micro-batch as a normal batch DataFrame. |
 
----
-
-## 11. FAQ — Questions That Actually Came Up
-
-Kept verbatim in spirit, because the next person will ask the same ones.
-
-### "Are we using PySpark Streaming?"
-
-Yes — **Spark Structured Streaming**, in **Phase 2 only**. Phase 1 is pure batch. See Section 8.0 for the DStreams warning; it is the easiest mistake to make.
-
-### "Is there really no training in Phase 2?"
-
-Correct. The streaming query **only loads a saved model and predicts**. It never calls `fit()`.
-
-Not a limitation we chose — MLlib physically cannot do it. `pipeline.fit()` on a streaming DataFrame throws. Structured Streaming supports `.transform()` (predict) but not `fit()` (train), and GBT / Random Forest have no incremental learning in any Spark API.
-
-### "So we train first, and then it predicts live?"
-
-Exactly.
-
-1. **Train once**, offline, on the historical CSV → save the model to disk.
-2. **Streaming job loads that saved model** → each new hour arrives → predict → write forecast.
-
-The model improves over time via **scheduled retraining** (Section 4.2), never inside the stream.
-
-### "Then how does the system ever learn from new data?"
-
-Separate loop:
-
-```
-stream writes predictions + actuals  →  accumulates
-        →  batch trainer reads that history later
-        →  produces v2  →  stream hot-swaps to v2  (Section 8.3)
-```
-
-The demo trick: retrain in another notebook, save `v2`, and the running stream picks it up **mid-flight** via the version marker. Looks like live learning; stays architecturally honest.
-
-### "Which do we build first?"
-
-**Phase 1, completely, until it produces an honest RMSE that beats the persistence baseline.**
-
-Streaming is the delivery mechanism, not the model. If you debug both at once you will not know whether a bad number means a broken model or a broken stream. Phase 1 also produces the saved artifact that Phase 2 needs in order to run at all.
-
-### "Where did the dataset come from?"
-
-**AirNow** (US Dept. of State / EPA embassy monitoring). Portal and citation in Section 5.2. Note the on-disk file is **pre-cleaned**, not the raw download.
-
----
-
-## 12. Team
+## 9. Team
 
 | Name | Student ID |
 |---|---|
@@ -502,25 +232,17 @@ Streaming is the delivery mechanism, not the model. If you debug both at once yo
 | Ahnuf Karim Chowdhury | 20220104122 |
 | Nahid Asef | 20220104128 |
 
----
-
-## 13. Status & Next Actions
+## 10. Status
 
 **Done**
-- Problem framing, targets, and dataset selected
+- Problem framing, targets and dataset selected
 - Proposal deck complete (12 slides)
-- Dataset profiled; all gotchas in Section 6 identified
+- Live data source located and verified after `dosairnowdata.org` went dead
+- Part 1 written: full exploration of the data, Q1–Q15
 
-**Not done**
-- Everything else. **No code exists.**
-
-**Next actions, in order**
-
-1. Move `dhaka_air_quality_clean.csv` into `data/raw/` in this directory
-2. Write the explicit schema (used by both phases)
-3. Phase 1 steps 2–4: clean, gap-fill, features
-4. Phase 1 steps 5–7: time-split, train, evaluate **against the persistence baseline**
-5. Phase 1 step 8: save `models/pm25_v1`
-6. Only then start Phase 2
-
-**Expected outcome (from the proposal):** accurate short-term PM2.5 forecasts for Dhaka; a scalable pipeline extendable to more cities and pollutants; public-health impact through earlier warnings; a foundation for a research publication.
+**Next**
+1. Run the notebook end to end
+2. Settle the ten open decisions in section 5
+3. Append **Part 2 — prepare the data**: act on decisions 1–6 and build the model inputs
+4. Append **Part 3 — train**: time split, train, and check against the persistence baseline
+5. Only then, the streaming predictor

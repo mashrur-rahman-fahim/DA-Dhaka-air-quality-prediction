@@ -1,3 +1,0 @@
-pyspark==4.0.4
-matplotlib
-pandas
