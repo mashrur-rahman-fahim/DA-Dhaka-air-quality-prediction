@@ -45,9 +45,16 @@ Dhaka has some of the worst air quality in the world.
 **Primary — regression.** Next-hour PM2.5 concentration in µg/m³. Scored with
 **RMSE** (same units as the thing predicted; lower is better).
 
-**Secondary — classification.** AQI category, `Good` through `Hazardous`.
-Easier for the public to read. Scored with **per-class F1 and AUC**, never plain
-accuracy — see the imbalance in Q13 below.
+**Secondary — classification.** Health category, `Good` through `Hazardous`.
+Easier for the public to read. Scored with **per-class F1**, never plain
+accuracy — only 3% of hours are `Good`, so a model that never predicts it still
+looks fine.
+
+The label is built from the reading we predict, using the official EPA
+thresholds — **not** taken from the file's own `aqi_category` column. That
+column labels NowCast, a twelve-hour smoothed average, which barely moves:
+copying the previous hour's value is already right **83.4%** of the time. Our
+label leaves real room to improve, at **71.9%**.
 
 Every model must beat the **persistence baseline**: *"the next hour will be the
 same as this hour."* Anything that cannot beat that has learned nothing.
@@ -150,7 +157,7 @@ The exploration deliberately settles nothing. These are the calls to make:
 5. **Which lags** — 1, 2, 3 and 24 are supported by Q11. Whether 168 (one week) earns its place is open; it costs rows.
 6. **Calendar inputs** — Q6 favours month, Q7 favours hour, Q8 argues against day of week.
 7. **Transform the target?** — Q5 says `log(1+x)` is far more symmetric. Test both.
-8. **Train/test cut-off** — must be by time, never `randomSplit`. Q3 and Q9 warn that the final partial year is dry-season only, so testing on it alone is seasonally biased.
+8. **Train/test cut-off** — must be by time, never `randomSplit`. Settled in Part 2: a **three-way** split, train to 2022 / validate on 2023 / test on 2024 onward, so choices are made on validation and the test set is opened once.
 9. **Which model** — gradient-boosted trees handle skew and interactions without scaling and report feature importance. A linear model makes a good sanity check.
 10. **PCA?** — probably not. After dropping constant and leaky columns there are about three real inputs. Trees are untroubled by correlated features, and PCA would destroy the *"the reading 24 hours ago mattered most"* result. Revisit only if weather data or more stations are added.
 
