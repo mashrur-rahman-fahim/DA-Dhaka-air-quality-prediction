@@ -19,3 +19,6 @@ venv/
 
 # OS
 .DS_Store
+
+# Multi-city downloads (Part 7)
+data_cities/
